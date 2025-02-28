@@ -3,7 +3,7 @@ parallel solution for kmeans problem
 
 
 # To Do
-MPI + OpenMP
+MPI + OpenMP  
 creare due funzioni, assign2cluster e calculateCentroids (per analisi della performance).  
 usare fma nella distanza euclidea.  
 
