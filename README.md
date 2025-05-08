@@ -9,5 +9,5 @@ parallel solution for kmeans problem
 
 Cuda  
 + migliorare algoritmo cuda.  
-+usare tipi dim3 per numero threads e blocchi.  
++ usare tipi dim3 per numero threads e blocchi.  
 + calcolare la performance (fare grafici)
