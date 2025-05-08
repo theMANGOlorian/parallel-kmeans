@@ -3,7 +3,7 @@ parallel solution for kmeans problem
 
 
 # To Do
-+ MPI + OpenMP  
+MPI + OpenMP  
 + usare fma nella distanza euclidea.  
 + calcolare la performance (fare grafici)
 
