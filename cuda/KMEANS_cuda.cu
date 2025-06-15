@@ -197,6 +197,7 @@ float euclideanDistance(float *point, float *center, int samples)
 		float diff = point[i]-center[i];
 		dist+= diff*diff;
 	}
+	dist = sqrt(dist);
 	return(dist);
 }
 
@@ -208,6 +209,7 @@ __device__ float CudaEuclideanDistance(float *point, float *center, int samples)
 		float diff = point[i]-center[i];
 		dist+= diff*diff;
 	}
+	dist = sqrtf(dist);
 	return(dist);
 }
 
@@ -283,20 +285,40 @@ __global__ void KernelClusterAssignment(float* data, float* centroids, int* clas
     }
 }
 
-// da ottimizare
-__global__ void KernelComputeClusterSum(float* data, int* classMap, float* auxCentroids, int* pointsPerClass, int lines, int samples, int K)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void KernelComputeClusterSum(float* data, int* classMap, float* auxCentroids, int* pointsPerClass, int lines, int samples, int K) {
+    extern __shared__ float sharedCentroids[]; // Dimensione = K * samples
+    __shared__ int sharedPointsPerClass[128];  // supponiamo K <= 128
 
-    // Assicurati che i thread non escano dai limiti
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + tid;
+
+    // Inizializza shared memory
+    for (int k = tid; k < K * samples; k += blockDim.x)
+        sharedCentroids[k] = 0.0f;
+    for (int k = tid; k < K; k += blockDim.x)
+        sharedPointsPerClass[k] = 0;
+    __syncthreads();
+
     if (i < lines) {
-        int cluster = classMap[i];  // Ottieni la classe del punto i
-        atomicAdd(&pointsPerClass[cluster - 1], 1);  // Incrementa il numero di punti per la classe (atomic per evitare condizioni di race)
+        int cluster = classMap[i] - 1;
+
+        // Aggiorna shared points count
+        atomicAdd(&sharedPointsPerClass[cluster], 1);
 
         for (int j = 0; j < samples; j++) {
-            // Somma i valori dei dati al centroide corrispondente
-            atomicAdd(&auxCentroids[(cluster - 1) * samples + j], data[i * samples + j]);
+            float val = data[i * samples + j];
+            atomicAdd(&sharedCentroids[cluster * samples + j], val);
         }
+    }
+
+    __syncthreads();
+
+    // Riduzione dei risultati condivisi nella memoria globale (una sola volta per blocco)
+    for (int k = tid; k < K * samples; k += blockDim.x) {
+        atomicAdd(&auxCentroids[k], sharedCentroids[k]);
+    }
+    for (int k = tid; k < K; k += blockDim.x) {
+        atomicAdd(&pointsPerClass[k], sharedPointsPerClass[k]);
     }
 }
 
@@ -312,7 +334,7 @@ __global__ void KenelUpdateCentroids(float* auxCentroids, int* pointsPerClass, i
 __global__ void KernelMaxDistance(float* centroids, float* auxCentroids, float* distCentroids, int K, int samples, float *maxDist){
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     // Memoria condivisa per il massimo all'interno di un blocco
-    __shared__ float sharedMaxDist[256];
+    __shared__ float sharedMaxDist[256]; // blockDim.x deve essere <= 256 !!
     
     int tid = threadIdx.x;
 
@@ -354,10 +376,10 @@ int main(int argc, char* argv[])
 	cudaEvent_t start, stop;
     float elapsedTime;
 
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    CHECK_CUDA_CALL(cudaEventCreate(&start));
+    CHECK_CUDA_CALL(cudaEventCreate(&stop));
 	
-	cudaEventRecord(start);
+	CHECK_CUDA_CALL(cudaEventRecord(start));
 	//**************************************************
 	/*
 	* PARAMETERS
@@ -408,6 +430,11 @@ int main(int argc, char* argv[])
 
 	// Parameters
 	int K=atoi(argv[2]); 
+	if (K > 128) {
+		fprintf(stderr,"Error: The maximum number of clusters is 128.\n");
+		fprintf(stderr,"Hardcode in KernelComputeClusterSum\n");
+		exit(-2);
+	}
 	int maxIterations=atoi(argv[3]);
 	int minChanges= (int)(lines*atof(argv[4])/100.0);
 	float maxThreshold=atof(argv[5]);
@@ -441,9 +468,9 @@ int main(int argc, char* argv[])
 	printf("\tMaximum centroid precision: %f\n", maxThreshold);
 	
 	//END CLOCK*****************************************
-	cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&elapsedTime, start, stop);
+	CHECK_CUDA_CALL(cudaEventRecord(stop));
+    CHECK_CUDA_CALL(cudaEventSynchronize(stop));
+    CHECK_CUDA_CALL(cudaEventElapsedTime(&elapsedTime, start, stop));
 	printf("\nTempo di allocazione: %f ms\n", elapsedTime);
 	fflush(stdout);
 
@@ -451,7 +478,7 @@ int main(int argc, char* argv[])
 	CHECK_CUDA_CALL( cudaDeviceSynchronize() );
 	//**************************************************
 	//START CLOCK***************************************
-	cudaEventRecord(start);
+	CHECK_CUDA_CALL(cudaEventRecord(start));
 
 	//**************************************************
 	char *outputMsg = (char *)calloc(10000,sizeof(char));
@@ -477,33 +504,32 @@ int main(int argc, char* argv[])
  * START HERE: DO NOT CHANGE THE CODE ABOVE THIS POINT
  *
  */
-	// Numero di thread per blocco e calcolo dei blocchi
-	int threadsPerBlock = 256;
-	int blocksPerGrid = (lines + threadsPerBlock - 1) / threadsPerBlock;
-	int blocksPerGrid2 = (K * samples + threadsPerBlock - 1) / threadsPerBlock;
-	int blocksPerGrid3 = (K + threadsPerBlock - 1) / threadsPerBlock;
-
-	printf("\nThreads per block: %d",threadsPerBlock);
-	printf("\nBlocks per grid: %d",blocksPerGrid);
+	dim3 blockDim(256);
+	dim3 gridDim1((lines + blockDim.x -1) / blockDim.x);
+	dim3 gridDim2((K * samples + blockDim.x - 1) / blockDim.x);
+	dim3 gridDim3((K + blockDim.x - 1) / blockDim.x);
 
 	// Allocazione memoria GPU
 	float *d_data, *d_auxCentroids, *d_centroids, *d_maxDist, *d_distCentroids;
 	int *d_classMap, *d_changes, *d_pointsPerClass;
 
 	// alloca memoria sulla GPU
-	cudaMalloc(&d_data, lines * samples * sizeof(float));
-	cudaMalloc(&d_auxCentroids, K * samples * sizeof(float));
-	cudaMalloc(&d_centroids, K * samples * sizeof(float));
-	cudaMalloc(&d_classMap, lines * sizeof(int));
-	cudaMalloc(&d_changes, sizeof(int));
-	cudaMalloc(&d_pointsPerClass, K * sizeof(int));
-	cudaMalloc((void**)&d_maxDist, sizeof(float));
-	cudaMalloc((void**)&d_distCentroids, K * sizeof(float));
+	CHECK_CUDA_CALL(cudaMalloc(&d_data, lines * samples * sizeof(float)));
+	CHECK_CUDA_CALL(cudaMalloc(&d_auxCentroids, K * samples * sizeof(float)));
+	CHECK_CUDA_CALL(cudaMalloc(&d_centroids, K * samples * sizeof(float)));
+	CHECK_CUDA_CALL(cudaMalloc(&d_classMap, lines * sizeof(int)));
+	CHECK_CUDA_CALL(cudaMalloc(&d_changes, sizeof(int)));
+	CHECK_CUDA_CALL(cudaMalloc(&d_pointsPerClass, K * sizeof(int)));
+	CHECK_CUDA_CALL(cudaMalloc((void**)&d_maxDist, sizeof(float)));
+	CHECK_CUDA_CALL(cudaMalloc((void**)&d_distCentroids, K * sizeof(float)));
 	
 	// Copia dati sulla GPU
-	cudaMemcpy(d_data, data, lines * samples * sizeof(float), cudaMemcpyHostToDevice);
-	cudaMemcpy(d_classMap, classMap, lines * sizeof(int), cudaMemcpyHostToDevice);
-	cudaMemcpy(d_centroids, centroids, K * samples * sizeof(float), cudaMemcpyHostToDevice);
+	CHECK_CUDA_CALL(cudaMemcpy(d_data, data, lines * samples * sizeof(float), cudaMemcpyHostToDevice));
+	CHECK_CUDA_CALL(cudaMemcpy(d_classMap, classMap, lines * sizeof(int), cudaMemcpyHostToDevice));
+	CHECK_CUDA_CALL(cudaMemcpy(d_centroids, centroids, K * samples * sizeof(float), cudaMemcpyHostToDevice));
+
+    int sharedMemSize = K * samples * sizeof(float);  // sharedCentroids
+    sharedMemSize += K * sizeof(int);                 // sharedPointsPerClass
 
 	// N.B: Cerca di ridurre il l'uso di cudaMemcpy Host <-> Device nel do-while (molto lento)
 	do{
@@ -513,36 +539,43 @@ int main(int argc, char* argv[])
 		//Assign each point to the nearest centroid.
 
 		// Aggiorna i dati sulla GPU
-		cudaMemset(d_changes,0, sizeof(int));
-		KernelClusterAssignment<<<blocksPerGrid, threadsPerBlock>>>(d_data, d_centroids, d_classMap, d_changes, lines, K, samples);
-		cudaDeviceSynchronize();
-		
+		CHECK_CUDA_CALL(cudaMemset(d_changes,0, sizeof(int)));
+		KernelClusterAssignment<<<gridDim1, blockDim>>>(d_data, d_centroids, d_classMap, d_changes, lines, K, samples);
+		CHECK_CUDA_LAST();
+		CHECK_CUDA_CALL(cudaDeviceSynchronize());
+		CHECK_CUDA_LAST();
 		// Copia il numero di cambiamenti dalla GPU
-		cudaMemcpy(&changes, d_changes, sizeof(int), cudaMemcpyDeviceToHost); // lento
+		CHECK_CUDA_CALL(cudaMemcpy(&changes, d_changes, sizeof(int), cudaMemcpyDeviceToHost)); // lento
 
 		// 2. Recalculates the centroids: calculates the mean within each cluster
-		cudaMemset(d_pointsPerClass, 0, K*sizeof(int)); //zeroIntArray(pointsPerClass,K);
-		cudaMemset(d_auxCentroids, 0, K * samples * sizeof(float)); //zeroFloatMatriz(auxCentroids,K,samples);
+		CHECK_CUDA_CALL(cudaMemset(d_pointsPerClass, 0, K*sizeof(int))); //zeroIntArray(pointsPerClass,K);
+		CHECK_CUDA_CALL(cudaMemset(d_auxCentroids, 0, K * samples * sizeof(float))); //zeroFloatMatriz(auxCentroids,K,samples);
 		
 		// Questo ciclo serve a calcolare la somma dei punti appartenenti a ciascun cluster.
-		KernelComputeClusterSum<<<blocksPerGrid, threadsPerBlock>>>(d_data, d_classMap, d_auxCentroids, d_pointsPerClass, lines, samples, K);
-		cudaDeviceSynchronize();
-		
+        
+        KernelComputeClusterSum<<<gridDim1, blockDim, sharedMemSize>>>(d_data, d_classMap, d_auxCentroids, d_pointsPerClass, lines, samples, K);
+		CHECK_CUDA_LAST();
+		CHECK_CUDA_CALL(cudaDeviceSynchronize());
+		CHECK_CUDA_LAST();
 		// Questo ciclo aggiorna i centroidi calcolando la media delle coordinate dei punti assegnati a ciascun cluster.
-		KenelUpdateCentroids<<<blocksPerGrid2, threadsPerBlock>>>(d_auxCentroids, d_pointsPerClass, K, samples);
-		cudaDeviceSynchronize();
+		KenelUpdateCentroids<<<gridDim2, blockDim>>>(d_auxCentroids, d_pointsPerClass, K, samples);
+		CHECK_CUDA_LAST();
+		CHECK_CUDA_CALL(cudaDeviceSynchronize());
+		CHECK_CUDA_LAST();
 		// Questo ciclo calcola la massima distanza tra i centroidi
-		KernelMaxDistance<<<blocksPerGrid3, threadsPerBlock>>>(d_centroids, d_auxCentroids, d_distCentroids, K, samples, d_maxDist);
-		cudaDeviceSynchronize();
-		cudaMemcpy(d_centroids, d_auxCentroids, K * samples * sizeof(float), cudaMemcpyDeviceToDevice);
-		cudaMemcpy(&maxDist, d_maxDist, sizeof(float), cudaMemcpyDeviceToHost); // lento
+		KernelMaxDistance<<<gridDim3, blockDim>>>(d_centroids, d_auxCentroids, d_distCentroids, K, samples, d_maxDist);
+		CHECK_CUDA_LAST();
+		CHECK_CUDA_CALL(cudaDeviceSynchronize());
+		CHECK_CUDA_LAST();
+		CHECK_CUDA_CALL(cudaMemcpy(d_centroids, d_auxCentroids, K * samples * sizeof(float), cudaMemcpyDeviceToDevice));
+		CHECK_CUDA_CALL(cudaMemcpy(&maxDist, d_maxDist, sizeof(float), cudaMemcpyDeviceToHost)); // lento
 
 		sprintf(line,"\n[%d] Cluster changes: %d\tMax. centroid distance: %f", it, changes, maxDist);
-		outputMsg = strcat(outputMsg,line);
+		outputMsg = line;
 
 	} while((changes>minChanges) && (it<maxIterations) && (maxDist>maxThreshold));
 
-	cudaMemcpy(classMap, d_classMap, lines * sizeof(int), cudaMemcpyDeviceToHost);
+	CHECK_CUDA_CALL(cudaMemcpy(classMap, d_classMap, lines * sizeof(int), cudaMemcpyDeviceToHost));
 /*
  *
  * STOP HERE: DO NOT CHANGE THE CODE BELOW THIS POINT
@@ -554,14 +587,27 @@ int main(int argc, char* argv[])
 	CHECK_CUDA_CALL( cudaDeviceSynchronize() );
 
 	//END CLOCK*****************************************
-	cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&elapsedTime, start, stop);
+	CHECK_CUDA_CALL(cudaEventRecord(stop));
+    CHECK_CUDA_CALL(cudaEventSynchronize(stop));
+    CHECK_CUDA_CALL(cudaEventElapsedTime(&elapsedTime, start, stop));
 	printf("\nComputation time: %f ms\n", elapsedTime);
+	float elapsedSeconds = elapsedTime / 1000.0f;
+	printf("\nComputation time: %.6f s\n", elapsedSeconds);
 	fflush(stdout);
+
+	// Salva su file in append
+	FILE *f = fopen("cudatimes.txt", "a");
+	if (f == NULL) {
+		perror("Errore nell'apertura del file cudatimes.txt");
+	} else {
+		fprintf(f, "%.6f\n", elapsedSeconds);
+		fclose(f);
+	}
+
+
 	//**************************************************
 	//START CLOCK***************************************
-	cudaEventRecord(start);
+	CHECK_CUDA_CALL(cudaEventRecord(start));
 	//**************************************************
 
 	if (changes <= minChanges) {
@@ -602,11 +648,18 @@ int main(int argc, char* argv[])
 	cudaFree(d_distCentroids);
 
 	//END CLOCK*****************************************
-	cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&elapsedTime, start, stop);
+	CHECK_CUDA_CALL(cudaEventRecord(stop));
+    CHECK_CUDA_CALL(cudaEventSynchronize(stop));
+    CHECK_CUDA_CALL(cudaEventElapsedTime(&elapsedTime, start, stop));
 	printf("\nTempo di deallocazione: %f ms\n", elapsedTime);
 	fflush(stdout);
 	//***************************************************/
 	return 0;
 }
+
+//** 
+// Come compilare sul cluster sapienza
+// srun --partition=students --gpus=1 nvcc -lm -fmad=false -arch=sm_75 KMEANS_cuda.cu -o KMEANS_cuda
+// srun --partition=students --gpus=1 KMEANS_cuda test_files/input100D2.inp 30 500 0.1 0.1 output_cuda.txt
+//  */
+
